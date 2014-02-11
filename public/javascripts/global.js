@@ -69,7 +69,7 @@ function showUserInfo(event) {
 
 // Add User
 function addUser(event) {
-  event.preventDefault;
+  event.preventDefault();
 
   // Super basic validation - increase errorCount variable if any fields are blank
   var errorCount = 0;
