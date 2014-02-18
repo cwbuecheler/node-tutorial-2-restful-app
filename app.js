@@ -10,13 +10,7 @@ var http = require('http');
 var path = require('path');
 // Database
 var mongo = require('mongoskin');
-var db = mongo.db([
-    'localhost:27017/?auto_reconnect'
-    ], {
-        database: 'nodetest2',
-        safe: true
-    }
-);
+var db = mongo.db("mongodb://localhost:27017/nodetest2", {native_parser:true});
 
 var app = express();
 
