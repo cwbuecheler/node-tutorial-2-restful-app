@@ -31,7 +31,7 @@ exports.adduser = function(db) {
 exports.deleteuser = function(db) {
   return function(req, res) {
     var userToDelete = req.params.id;
-    db.collection('userlist').remove({ '_id' : db.collection('userlist').id(userToDelete)}, function(err, result) {
+    db.collection('userlist').removeById(userToDelete, function(err, result) {
       res.send((result === 1) ? { msg: '' } : { msg:'error: ' + err });
     });
   }
