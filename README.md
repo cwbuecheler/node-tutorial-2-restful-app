@@ -6,6 +6,8 @@ A complete sample project for Front-End developers teaching the basics of REST a
 
 [Visit the tutorial online](http://cwbuecheler.com/web/tutorials/2014/restful-web-app-node-express-mongodb/), follow along with it, write your own code, compare it to this working sample code.
 
+**Note: If you want to run this sample code, you will need to do an NPM Install, as the node_modules directory has been removed from the repo.**
+
 
 ## Author
 
@@ -14,7 +16,6 @@ Christopher Buecheler is a front-end developer for a small San Francisco startup
 
 ## Contents
 
-* /node_modules - all dependencies for tutorial
 * /public - static directories suchs as /images
 * /routes - route files for tutorial project
 * /views - views for tutorial project

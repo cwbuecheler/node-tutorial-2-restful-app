@@ -39,8 +39,8 @@ var REFERENCE_BY_FILENAME = 0,
  *  - **readPreference** {String}, the prefered read preference (ReadPreference.PRIMARY, ReadPreference.PRIMARY_PREFERRED, ReadPreference.SECONDARY, ReadPreference.SECONDARY_PREFERRED, ReadPreference.NEAREST).
  *  - **w**, {Number/String, > -1 || 'majority' || tag name} the write concern for the operation where < 1 is no acknowlegement of write and w >= 1, w = 'majority' or tag acknowledges the write
  *  - **wtimeout**, {Number, 0} set the timeout for waiting for write concern to finish (combines with w option)
- *  - **fsync**, (Boolean, default:false) write waits for fsync before returning
- *  - **journal**, (Boolean, default:false) write waits for journal sync before returning
+ *  - **fsync**, (Boolean, default:false) write waits for fsync before returning, from MongoDB 2.6 on, fsync cannot be combined with journal
+ *  - **j**, (Boolean, default:false) write waits for journal sync before returning
  *
  * @class Represents the GridStore.
  * @param {Db} db A database instance to interact with.
@@ -59,9 +59,6 @@ var GridStore = function GridStore(db, id, filename, mode, options) {
   // Call stream constructor
   if(typeof Stream == 'function') {
     Stream.call(this);
-  } else {
-    // 0.4.X backward compatibility fix
-    Stream.Stream.call(this);
   }
 
   // Handle options
@@ -94,20 +91,17 @@ var GridStore = function GridStore(db, id, filename, mode, options) {
 
   // Set up the rest
   this.mode = mode == null ? "r" : mode;
-  this.options = options == null ? {w:1} : options;
+  this.options = options || {};
   
-  // If we have no write concerns set w:1 as default
-  if(this.options.w == null 
-    && this.options.j == null
-    && this.options.fsync == null) this.options.w = 1;
-
   // Set the root if overridden
   this.root = this.options['root'] == null ? exports.GridStore.DEFAULT_ROOT_COLLECTION : this.options['root'];
   this.position = 0;
   this.readPreference = this.options.readPreference || 'primary';
-  this.writeConcern =  _getWriteConcern(this, this.options);
+  this.writeConcern = _getWriteConcern(db, this.options);
   // Set default chunk size
   this.internalChunkSize = this.options['chunkSize'] == null ? Chunk.DEFAULT_CHUNK_SIZE : this.options['chunkSize'];
+  // Save a write connection to ensure same write connection
+  this.connection = db.serverConfig.checkoutWriter();
 }
 
 /**
@@ -141,31 +135,30 @@ GridStore.prototype.open = function(callback) {
   }
 
   var self = this;
+
+  // Get the write concern
+  var writeConcern = _getWriteConcern(this.db, this.options);
+  writeConcern.connection = self.connection;
+
   // If we are writing we need to ensure we have the right indexes for md5's
   if((self.mode == "w" || self.mode == "w+")) {
     // Get files collection
-    self.collection(function(err, collection) {
+    var collection = self.collection();
+    // Put index on filename
+    collection.ensureIndex([['filename', 1]], writeConcern, function(err, index) {
       if(err) return callback(err);
 
-      // Put index on filename
-      collection.ensureIndex([['filename', 1]], function(err, index) {
+      // Get chunk collection
+      var chunkCollection = self.chunkCollection();
+      // Ensure index on chunk collection
+      chunkCollection.ensureIndex([['files_id', 1], ['n', 1]], writeConcern, function(err, index) {
         if(err) return callback(err);
-
-        // Get chunk collection
-        self.chunkCollection(function(err, chunkCollection) {
-          if(err) return callback(err);
-
-          // Ensure index on chunk collection
-          chunkCollection.ensureIndex([['files_id', 1], ['n', 1]], function(err, index) {
-            if(err) return callback(err);
-            _open(self, callback);
-          });
-        });
+        _open(self, writeConcern, callback);
       });
     });
   } else {
     // Open the gridstore
-    _open(self, callback);
+    _open(self, writeConcern, callback);
   }
 };
 
@@ -174,116 +167,112 @@ GridStore.prototype.open = function(callback) {
  * @ignore
  * @api private
  */
-var _open = function(self, callback) {
-  self.collection(function(err, collection) {
-    if(err!==null) {
-      callback(new Error("at collection: "+err), null);
-      return;
-    }
+var _open = function(self, options, callback) {
+  var collection = self.collection();
+  // Create the query
+  var query = self.referenceBy == REFERENCE_BY_ID ? {_id:self.fileId} : {filename:self.filename};
+  query = null == self.fileId && this.filename == null ? null : query;
+  options.readPreference = self.readPreference;
 
-    // Create the query
-    var query = self.referenceBy == REFERENCE_BY_ID ? {_id:self.fileId} : {filename:self.filename};
-    query = null == self.fileId && this.filename == null ? null : query;
+  // Fetch the chunks
+  if(query != null) {
+    collection.find(query, options, function(err, cursor) {
+      if(err) return error(err);
 
-    // Fetch the chunks
-    if(query != null) {
-      collection.find(query, {readPreference:self.readPreference}, function(err, cursor) {
+      // Fetch the file
+      cursor.nextObject(function(err, doc) {
         if(err) return error(err);
 
-        // Fetch the file
-        cursor.nextObject(function(err, doc) {
-          if(err) return error(err);
+        // Check if the collection for the files exists otherwise prepare the new one
+        if(doc != null) {
+          self.fileId = doc._id;
+          self.filename = doc.filename;
+          self.contentType = doc.contentType;
+          self.internalChunkSize = doc.chunkSize;
+          self.uploadDate = doc.uploadDate;
+          self.aliases = doc.aliases;
+          self.length = doc.length;
+          self.metadata = doc.metadata;
+          self.internalMd5 = doc.md5;
+        } else if (self.mode != 'r') {
+          self.fileId = self.fileId == null ? new ObjectID() : self.fileId;
+          self.contentType = exports.GridStore.DEFAULT_CONTENT_TYPE;
+          self.internalChunkSize = self.internalChunkSize == null ? Chunk.DEFAULT_CHUNK_SIZE : self.internalChunkSize;
+          self.length = 0;
+        } else {
+          self.length = 0;
+          var txtId = self.fileId instanceof ObjectID ? self.fileId.toHexString() : self.fileId;
+          return error(new Error((self.referenceBy == REFERENCE_BY_ID ? txtId : self.filename) + " does not exist", self));
+        }
 
-          // Check if the collection for the files exists otherwise prepare the new one
-          if(doc != null) {
-            self.fileId = doc._id;
-            self.filename = doc.filename;
-            self.contentType = doc.contentType;
-            self.internalChunkSize = doc.chunkSize;
-            self.uploadDate = doc.uploadDate;
-            self.aliases = doc.aliases;
-            self.length = doc.length;
-            self.metadata = doc.metadata;
-            self.internalMd5 = doc.md5;
-          } else if (self.mode != 'r') {
-            self.fileId = self.fileId == null ? new ObjectID() : self.fileId;
-            self.contentType = exports.GridStore.DEFAULT_CONTENT_TYPE;
-            self.internalChunkSize = self.internalChunkSize == null ? Chunk.DEFAULT_CHUNK_SIZE : self.internalChunkSize;
-            self.length = 0;
-          } else {
-            self.length = 0;
-            var txtId = self.fileId instanceof ObjectID ? self.fileId.toHexString() : self.fileId;
-            return error(new Error((self.referenceBy == REFERENCE_BY_ID ? txtId : self.filename) + " does not exist", self));
-          }
-
-          // Process the mode of the object
-          if(self.mode == "r") {
-            nthChunk(self, 0, function(err, chunk) {
-              if(err) return error(err);
-              self.currentChunk = chunk;
-              self.position = 0;
-              callback(null, self);
-            });
-          } else if(self.mode == "w") {
-            // Delete any existing chunks
-            deleteChunks(self, function(err, result) {
-              if(err) return error(err);
-              self.currentChunk = new Chunk(self, {'n':0}, self.writeConcern);
-              self.contentType = self.options['content_type'] == null ? self.contentType : self.options['content_type'];
-              self.internalChunkSize = self.options['chunk_size'] == null ? self.internalChunkSize : self.options['chunk_size'];
-              self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
-              self.position = 0;
-              callback(null, self);
-            });
-          } else if(self.mode == "w+") {
-            nthChunk(self, lastChunkNumber(self), function(err, chunk) {
-              if(err) return error(err);
-              // Set the current chunk
-              self.currentChunk = chunk == null ? new Chunk(self, {'n':0}, self.writeConcern) : chunk;
-              self.currentChunk.position = self.currentChunk.data.length();
-              self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
-              self.position = self.length;
-              callback(null, self);
-            });
-          }
-        });
-      });
-    } else {
-      // Write only mode
-      self.fileId = null == self.fileId ? new ObjectID() : self.fileId;
-      self.contentType = exports.GridStore.DEFAULT_CONTENT_TYPE;
-      self.internalChunkSize = self.internalChunkSize == null ? Chunk.DEFAULT_CHUNK_SIZE : self.internalChunkSize;
-      self.length = 0;
-
-      self.chunkCollection(function(err, collection2) {
-        if(err) return error(err);
-
-        // No file exists set up write mode
-        if(self.mode == "w") {
+        // Process the mode of the object
+        if(self.mode == "r") {
+          nthChunk(self, 0, options, function(err, chunk) {
+            if(err) return error(err);
+            self.currentChunk = chunk;
+            self.position = 0;
+            callback(null, self);
+          });
+        } else if(self.mode == "w") {
           // Delete any existing chunks
-          deleteChunks(self, function(err, result) {
+          deleteChunks(self, options, function(err, result) {
             if(err) return error(err);
             self.currentChunk = new Chunk(self, {'n':0}, self.writeConcern);
             self.contentType = self.options['content_type'] == null ? self.contentType : self.options['content_type'];
             self.internalChunkSize = self.options['chunk_size'] == null ? self.internalChunkSize : self.options['chunk_size'];
             self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
+            self.aliases = self.options['aliases'] == null ? self.aliases : self.options['aliases'];
             self.position = 0;
             callback(null, self);
           });
         } else if(self.mode == "w+") {
-          nthChunk(self, lastChunkNumber(self), function(err, chunk) {
+          nthChunk(self, lastChunkNumber(self), options, function(err, chunk) {
             if(err) return error(err);
             // Set the current chunk
             self.currentChunk = chunk == null ? new Chunk(self, {'n':0}, self.writeConcern) : chunk;
             self.currentChunk.position = self.currentChunk.data.length();
             self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
+            self.aliases = self.options['aliases'] == null ? self.aliases : self.options['aliases'];
             self.position = self.length;
             callback(null, self);
           });
         }
       });
+    });
+  } else {
+    // Write only mode
+    self.fileId = null == self.fileId ? new ObjectID() : self.fileId;
+    self.contentType = exports.GridStore.DEFAULT_CONTENT_TYPE;
+    self.internalChunkSize = self.internalChunkSize == null ? Chunk.DEFAULT_CHUNK_SIZE : self.internalChunkSize;
+    self.length = 0;
+
+    var collection2 = self.chunkCollection();
+    // No file exists set up write mode
+    if(self.mode == "w") {
+      // Delete any existing chunks
+      deleteChunks(self, options, function(err, result) {
+        if(err) return error(err);
+        self.currentChunk = new Chunk(self, {'n':0}, self.writeConcern);
+        self.contentType = self.options['content_type'] == null ? self.contentType : self.options['content_type'];
+        self.internalChunkSize = self.options['chunk_size'] == null ? self.internalChunkSize : self.options['chunk_size'];
+        self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
+        self.aliases = self.options['aliases'] == null ? self.aliases : self.options['aliases'];
+        self.position = 0;
+        callback(null, self);
+      });
+    } else if(self.mode == "w+") {
+      nthChunk(self, lastChunkNumber(self), options, function(err, chunk) {
+        if(err) return error(err);
+        // Set the current chunk
+        self.currentChunk = chunk == null ? new Chunk(self, {'n':0}, self.writeConcern) : chunk;
+        self.currentChunk.position = self.currentChunk.data.length();
+        self.metadata = self.options['metadata'] == null ? self.metadata : self.options['metadata'];
+        self.aliases = self.options['aliases'] == null ? self.aliases : self.options['aliases'];
+        self.position = self.length;
+        callback(null, self);
+      });
     }
-  });
+  }
 
   // only pass error to callback once
   function error (err) {
@@ -332,7 +321,7 @@ GridStore.prototype.writeFile = function (file, callback) {
           chunk.write(data, function(err, chunk) {
             if(err) return callback(err, self);
 
-            chunk.save(function(err, result) {
+            chunk.save({connection: self.connection}, function(err, result) {
               if(err) return callback(err, self);
 
               self.position = self.position + data.length;
@@ -376,7 +365,7 @@ GridStore.prototype.writeFile = function (file, callback) {
  */
 var writeBuffer = function(self, buffer, close, callback) {
   if(typeof close === "function") { callback = close; close = null; }
-  var finalClose = (close == null) ? false : close;
+  var finalClose = typeof close == 'boolean' ? close : false;
 
   if(self.mode[0] != "w") {
     callback(new Error((self.referenceBy == REFERENCE_BY_ID ? self.toHexString() : self.filename) + " not opened for writing"), null);
@@ -413,25 +402,39 @@ var writeBuffer = function(self, buffer, close, callback) {
       self.position = self.position + buffer.length;
       // Total number of chunks to write
       var numberOfChunksToWrite = chunksToWrite.length;
-      // Write out all the chunks and then return
+
       for(var i = 0; i < chunksToWrite.length; i++) {
-        var chunk = chunksToWrite[i];
-        chunk.save(function(err, result) {
+        chunksToWrite[i].save({connection:self.connection}, function(err, result) {
           if(err) return callback(err);
 
           numberOfChunksToWrite = numberOfChunksToWrite - 1;
 
           if(numberOfChunksToWrite <= 0) {
+            // We care closing the file before returning
+            if(finalClose) {
+              return self.close(function(err, result) {
+                callback(err, self);
+              });
+            }
+            
+            // Return normally
             return callback(null, self);
           }
-        })
+        });
       }
     } else {
       // Update the position for the gridstore
       self.position = self.position + buffer.length;
       // We have less data than the chunk size just write it and callback
       self.currentChunk.write(buffer);
-      callback(null, self);
+      // We care closing the file before returning
+      if(finalClose) {
+        return self.close(function(err, result) {
+          callback(err, self);
+        });
+      }
+      // Return normally
+      return callback(null, self);
     }
   }
 };
@@ -474,8 +477,10 @@ var buildMongoObject = function(self, callback) {
 
   var md5Command = {filemd5:self.fileId, root:self.root};
   self.db.command(md5Command, function(err, results) {
+    if(err) return callback(err);
+
     mongoObject.md5 = results.md5;
-    callback(mongoObject);
+    callback(null, mongoObject);
   });
 };
 
@@ -492,8 +497,12 @@ GridStore.prototype.close = function(callback) {
   var self = this;
 
   if(self.mode[0] == "w") {
+    // Set up options
+    var options = self.writeConcern;
+    options.connection = self.connection;
+
     if(self.currentChunk != null && self.currentChunk.position > 0) {
-      self.currentChunk.save(function(err, chunk) {
+      self.currentChunk.save({connection: self.connection}, function(err, chunk) {
         if(err && typeof callback == 'function') return callback(err);
 
         self.collection(function(err, files) {
@@ -501,11 +510,15 @@ GridStore.prototype.close = function(callback) {
 
           // Build the mongo object
           if(self.uploadDate != null) {
-            files.remove({'_id':self.fileId}, {safe:true}, function(err, collection) {
+            files.remove({'_id':self.fileId}, self.writeConcern, function(err, collection) {
               if(err && typeof callback == 'function') return callback(err);
 
-              buildMongoObject(self, function(mongoObject) {
-                files.save(mongoObject, self.writeConcern, function(err) {
+              buildMongoObject(self, function(err, mongoObject) {
+                if(err) {
+                  if(typeof callback == 'function') return callback(err); else throw err;
+                }
+
+                files.save(mongoObject, options, function(err) {
                   if(typeof callback == 'function')
                     callback(err, mongoObject);
                 });
@@ -513,8 +526,12 @@ GridStore.prototype.close = function(callback) {
             });
           } else {
             self.uploadDate = new Date();
-            buildMongoObject(self, function(mongoObject) {
-              files.save(mongoObject, self.writeConcern, function(err) {
+            buildMongoObject(self, function(err, mongoObject) {
+              if(err) {
+                if(typeof callback == 'function') return callback(err); else throw err;
+              }
+
+              files.save(mongoObject, options, function(err) {
                 if(typeof callback == 'function')
                   callback(err, mongoObject);
               });
@@ -527,8 +544,12 @@ GridStore.prototype.close = function(callback) {
         if(err && typeof callback == 'function') return callback(err);
 
         self.uploadDate = new Date();
-        buildMongoObject(self, function(mongoObject) {
-          files.save(mongoObject, self.writeConcern, function(err) {
+        buildMongoObject(self, function(err, mongoObject) {
+          if(err) {
+            if(typeof callback == 'function') return callback(err); else throw err;
+          }
+
+          files.save(mongoObject, options, function(err) {
             if(typeof callback == 'function')
               callback(err, mongoObject);
           });
@@ -556,19 +577,23 @@ GridStore.prototype.close = function(callback) {
  * @ignore
  * @api private
  */
-var nthChunk = function(self, chunkNumber, callback) {
-  self.chunkCollection(function(err, collection) {
+var nthChunk = function(self, chunkNumber, options, callback) {
+  if(typeof options == 'function') {
+    callback = options;
+    options = {};
+  }
+
+  options = options || self.writeConcern;
+  options.readPreference = self.readPreference;
+  // Get the nth chunk
+  self.chunkCollection().find({'files_id':self.fileId, 'n':chunkNumber}, options, function(err, cursor) {
     if(err) return callback(err);
 
-    collection.find({'files_id':self.fileId, 'n':chunkNumber}, {readPreference: self.readPreference}, function(err, cursor) {
+    cursor.nextObject(function(err, chunk) {
       if(err) return callback(err);
 
-      cursor.nextObject(function(err, chunk) {
-        if(err) return callback(err);
-
-        var finalChunk = chunk == null ? {} : chunk;
-        callback(null, new Chunk(self, finalChunk, self.writeConcern));
-      });
+      var finalChunk = chunk == null ? {} : chunk;
+      callback(null, new Chunk(self, finalChunk, self.writeConcern));
     });
   });
 };
@@ -589,7 +614,7 @@ GridStore.prototype._nthChunk = function(chunkNumber, callback) {
  * @api private
  */
 var lastChunkNumber = function(self) {
-  return Math.floor(self.length/self.chunkSize);
+  return Math.floor((self.length ? self.length - 1 : 0)/self.chunkSize);
 };
 
 /**
@@ -600,7 +625,9 @@ var lastChunkNumber = function(self) {
  * @api public
  */
 GridStore.prototype.chunkCollection = function(callback) {
-  this.db.collection((this.root + ".chunks"), callback);
+  if(typeof callback == 'function')
+    return this.db.collection((this.root + ".chunks"), callback);
+  return this.db.collection((this.root + ".chunks"));
 };
 
 /**
@@ -612,14 +639,18 @@ GridStore.prototype.chunkCollection = function(callback) {
  * @ignore
  * @api private
  */
-var deleteChunks = function(self, callback) {
+var deleteChunks = function(self, options, callback) {
+  if(typeof options == 'function') {
+    callback = options;
+    options = {};
+  }
+
+  options = options || self.writeConcern;
+
   if(self.fileId != null) {
-    self.chunkCollection(function(err, collection) {
+    self.chunkCollection().remove({'files_id':self.fileId}, options, function(err, result) {
       if(err) return callback(err, false);
-      collection.remove({'files_id':self.fileId}, {safe:true}, function(err, result) {
-        if(err) return callback(err, false);
-        callback(null, true);
-      });
+      callback(null, true);
     });
   } else {
     callback(null, true);
@@ -647,7 +678,7 @@ GridStore.prototype.unlink = function(callback) {
         return callback(err);
       }
 
-      collection.remove({'_id':self.fileId}, {safe:true}, function(err) {
+      collection.remove({'_id':self.fileId}, self.writeConcern, function(err) {
         callback(err, self);
       });
     });
@@ -662,7 +693,9 @@ GridStore.prototype.unlink = function(callback) {
  * @api public
  */
 GridStore.prototype.collection = function(callback) {
-  this.db.collection(this.root + ".files", callback);
+  if(typeof callback == 'function')
+    this.db.collection(this.root + ".files", callback);
+  return this.db.collection(this.root + ".files");
 };
 
 /**
@@ -850,7 +883,7 @@ GridStore.prototype.seek = function(position, seekLocation, callback) {
     };
 
     if(self.mode[0] == 'w') {
-      self.currentChunk.save(function(err) {
+      self.currentChunk.save({connection:self.connection}, function(err) {
         if(err) return callback(err);
         seekChunk();
       });
@@ -1133,13 +1166,17 @@ GridStore.unlink = function(db, names, options, callback) {
   var self = this;
   var args = Array.prototype.slice.call(arguments, 2);
   callback = args.pop();
-  options = args.length ? args.shift() : null;
+  options = args.length ? args.shift() : {};
 
+  // Get the write concern
+  var writeConcern = _getWriteConcern(db, options);
+
+  // List of names
   if(names.constructor == Array) {
     var tc = 0;
     for(var i = 0; i < names.length; i++) {
       ++tc;
-      self.unlink(db, names[i], options, function(result) {
+      GridStore.unlink(db, names[i], options, function(result) {
         if(--tc == 0) {
             callback(null, self);
         }
@@ -1152,7 +1189,7 @@ GridStore.unlink = function(db, names, options, callback) {
         if(err) return callback(err);
         gridStore.collection(function(err, collection) {
           if(err) return callback(err);
-          collection.remove({'_id':gridStore.fileId}, {safe:true}, function(err, collection) {
+          collection.remove({'_id':gridStore.fileId}, writeConcern, function(err, result) {
             callback(err, self);
           });
         });
@@ -1273,7 +1310,6 @@ var _writeNormal = function(self, data, close, callback) {
   if(Buffer.isBuffer(data)) {
     return writeBuffer(self, data, close, callback);
   } else {
-    // Wrap the string in a buffer and write
     return writeBuffer(self, new Buffer(data, 'binary'), close, callback);
   }
 }
@@ -1300,7 +1336,7 @@ GridStore.prototype.write = function write(data, close, callback) {
   }
 
   // queue data until we open.
-  if (!this._opened) {
+  if(!this._opened) {
     // Set up a queue to save data until gridstore object is ready
     this._q = [];
     _openStream(self);
@@ -1512,28 +1548,28 @@ var _setWriteConcernHash = function(options) {
 /**
  * @ignore
  */
-var _getWriteConcern = function(self, options, callback) {
+var _getWriteConcern = function(self, options) {
   // Final options
   var finalOptions = {w:1};
   options = options || {};
   // Local options verification
   if(options.w != null || typeof options.j == 'boolean' || typeof options.journal == 'boolean' || typeof options.fsync == 'boolean') {
     finalOptions = _setWriteConcernHash(options);
-  } else if(typeof options.safe == "boolean") {
-    finalOptions = {w: (options.safe ? 1 : 0)};
   } else if(options.safe != null && typeof options.safe == 'object') {
     finalOptions = _setWriteConcernHash(options.safe);
-  } else if(self.db.safe.w != null || typeof self.db.safe.j == 'boolean' || typeof self.db.safe.journal == 'boolean' || typeof self.db.safe.fsync == 'boolean') {
-    finalOptions = _setWriteConcernHash(self.db.safe);
-  } else if(self.db.options.w != null || typeof self.db.options.j == 'boolean' || typeof self.db.options.journal == 'boolean' || typeof self.db.options.fsync == 'boolean') {
-    finalOptions = _setWriteConcernHash(self.db.options);
-  } else if(typeof self.db.safe == "boolean") {
-    finalOptions = {w: (self.db.safe ? 1 : 0)};
+  } else if(typeof options.safe == "boolean") {
+    finalOptions = {w: (options.safe ? 1 : 0)};
+  } else if(self.options.w != null || typeof self.options.j == 'boolean' || typeof self.options.journal == 'boolean' || typeof self.options.fsync == 'boolean') {
+    finalOptions = _setWriteConcernHash(self.options);
+  } else if(self.safe.w != null || typeof self.safe.j == 'boolean' || typeof self.safe.journal == 'boolean' || typeof self.safe.fsync == 'boolean') {
+    finalOptions = _setWriteConcernHash(self.safe);
+  } else if(typeof self.safe == "boolean") {
+    finalOptions = {w: (self.safe ? 1 : 0)};
   }
 
   // Ensure we don't have an invalid combination of write concerns
   if(finalOptions.w < 1 
-    && (finalOptions.journal == true || finalOptions.j == true || finalOptions.fsync == true)) throw new Error("No acknowlegement using w < 1 cannot be combined with journal:true or fsync:true");
+    && (finalOptions.journal == true || finalOptions.j == true || finalOptions.fsync == true)) throw new Error("No acknowledgement using w < 1 cannot be combined with journal:true or fsync:true");
 
   // Return the options
   return finalOptions;
