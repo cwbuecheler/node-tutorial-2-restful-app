@@ -1,3 +1,5 @@
+# Note: This code is now archived and no longer being actively maintained. I can't guarantee it will continue to work, sorry!
+
 #Creating a Simple RESTful Web App with Node.js, Express, and MongoDB
 
 A complete sample project for Front-End developers teaching the basics of REST and using them to build an easy, fast, single-page web app.
